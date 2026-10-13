@@ -26,7 +26,7 @@ function harden(app) {
 function errors(error,req,res,next) {
   if(res.headersSent)return next(error);
   const e=error instanceof ZodError ? {status:400,code:'invalid_input',message:'Invalid request fields.'} : error?.type==='entity.parse.failed' ? {status:400,code:'invalid_json',message:'Invalid JSON body.'} : error?.type==='entity.too.large' ? {status:413,code:'body_too_large',message:'Request is too large.'} : publicError(error);
-  res.status(e.status).json({error:e.code,message:e.message});
+  res.locals.errorCode=e.code;res.status(e.status).json({error:e.code,message:e.message});
 }
 export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,cloudflare=new Cloudflare(hub.store,hub.vault,adminPort),instance=null,dataDir=null,shutdown,prepareMaintenance,requireToken=true,localSetup=new LocalSetup(hub,{gatewayPort})}) {
   const admin=express(),gateway=express();harden(admin);harden(gateway);
@@ -135,10 +135,18 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
   admin.use((req,res)=>res.status(404).json({error:'not_found'}));admin.use(errors);
 
   let accessKeyset,accessIssuer;
+  // Opt-in request log for diagnosing remote clients: status, error code and which
+  // auth-related headers were present. Never logs header values, bodies or tokens.
+  if(process.env.LINE_BRIDGE_GATEWAY_LOG==='1')gateway.use((req,res,next)=>{
+    const h=req.headers,seen=['authorization','cf-access-jwt-assertion','origin','referer','sec-fetch-mode','sec-fetch-site','sec-fetch-dest'].filter(name=>h[name]!==undefined);
+    const bearer=typeof h.authorization==='string'?(h.authorization.startsWith('Bearer lb_')?'lb':h.authorization.startsWith('Bearer ')?'other':'non-bearer'):'none';
+    res.on('finish',()=>console.error(JSON.stringify({gateway:new Date().toISOString(),method:req.method,path:req.path,host:h.host,status:res.statusCode,error:res.locals.errorCode??null,bearer,headers:seen,accept:h.accept??null,ua:String(h['user-agent']??'').slice(0,60)})));
+    next();
+  });
   gateway.use((req,res,next)=>{
     const hosts=new Set([`localhost:${gatewayPort}`,`127.0.0.1:${gatewayPort}`,tunnels.gatewayHostname()].filter(Boolean));
-    if(!hosts.has(req.headers.host))return res.status(403).json({error:'host_denied'});
-    if(browserRequest(req))return res.status(403).json({error:'browser_origin_denied',message:'Use a server-side AI client. The dashboard is on its separate local port.'});
+    if(!hosts.has(req.headers.host)){res.locals.errorCode='host_denied';return res.status(403).json({error:'host_denied'});}
+    if(browserRequest(req)){res.locals.errorCode='browser_origin_denied';return res.status(403).json({error:'browser_origin_denied',message:'Use a server-side AI client. The dashboard is on its separate local port.'});}
     next();
   });
   gateway.get('/health',(req,res)=>res.json({service:'LineBridge',version:VERSION,status:'running'}));
