@@ -213,7 +213,7 @@ test('dashboard combined setup enrolls privately; local profiles reject browsers
   assert.equal((await fetch(route,{method:'POST',headers,body:JSON.stringify({...JSON.parse(body),autoMonitorNewChats:'true'})})).status,400);
   const automatic=await (await fetch(route,{method:'POST',headers,body:JSON.stringify({...JSON.parse(body),autoMonitorNewChats:true})})).json();
   assert.equal(automatic.autoMonitorNewChats,true);
-  hub.driver(a.id).rooms.push({id:'http-future-room',name:'Future room',kind:'openchat'});await hub.discover(a.id);
+  hub.driver(a.id).rooms.push({id:'http-future-room',name:'Future room',kind:'group'});await hub.discover(a.id);
   const updatedState=await (await fetch(`${local}/admin/state`,{headers:{Cookie:cookie}})).json();
   assert.equal(updatedState.accounts[0].localSetup.autoMonitorNewChats,true);assert.ok(updatedState.accounts[0].localSetup.chatIds.includes('http-future-room'));
   const currentAuthorization={Authorization:`Bearer ${items.get(automatic.profile).token}`};
