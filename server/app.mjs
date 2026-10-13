@@ -13,6 +13,7 @@ import {VERSION} from './version.mjs';
 import {LocalSetup} from './local-setup.mjs';
 import {ChatAccess} from './chat-access.mjs';
 import {ADMIN_JSON_LIMIT} from './limits.mjs';
+import {identityConfig,identityEnabled,configureIdentity,identityActor} from './access-identity.mjs';
 
 function freshQuery(req){if(req.query.fresh===undefined)return false;if(!['true','false'].includes(req.query.fresh))fail(400,'invalid_input','fresh must be true or false.');return req.query.fresh==='true';}
 function harden(app) {
@@ -69,7 +70,7 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
   admin.get('/admin/state',asyncRoute(async(req,res)=>{
     const startedAt=Date.now();
     try{
-      const state={version:VERSION,backend:'node',locale:'zh-TW',instance,cli:{node:process.execPath,script:join(root,'bin/linebridge.mjs'),platform:process.platform},accounts:await Promise.all(hub.accounts(adminActor).map(async a=>({...a,localSetup:await localSetup.status(a.id),localAccess:hub.localAccess(a.id),discovery:hub.store.setting(`discovery:${a.id}`,null)}))),tokens:hub.tokens(),tunnel:await tunnels.status(),cloudflare:cloudflare.status(),
+      const state={version:VERSION,backend:'node',locale:'zh-TW',instance,cli:{node:process.execPath,script:join(root,'bin/linebridge.mjs'),platform:process.platform},accounts:await Promise.all(hub.accounts(adminActor).map(async a=>({...a,localSetup:await localSetup.status(a.id),localAccess:hub.localAccess(a.id),discovery:hub.store.setting(`discovery:${a.id}`,null)}))),tokens:hub.tokens(),accessIdentity:identityConfig(hub.store),tunnel:await tunnels.status(),cloudflare:cloudflare.status(),
         chatCounts:Object.fromEntries(hub.store.accounts().map(a=>[a.id,hub.store.chats(a.id).length])),
         gateway:{port:gatewayPort,mcp:'/mcp',api:'/api/v1',authentication:authentication(),requireToken,enabled:hub.store.setting('aiEnabled',true)},refresh:hub.refreshSettings(),vault:hub.vault.protection};
       hub.debug.refresh(startedAt,state);
@@ -111,6 +112,8 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
   admin.put('/admin/tokens/:id/grants',(req,res)=>res.json(hub.updateTokenScope(req.params.id,req.body)));
   admin.delete('/admin/tokens/:id',(req,res)=>{hub.store.revoke(req.params.id);hub.store.audit('local-admin','token.revoke',null,null,'ok');res.json({ok:true});});
   admin.put('/admin/tunnel',(req,res)=>res.json(tunnels.configure(req.body)));
+  admin.get('/admin/access-identity',(req,res)=>res.json(identityConfig(hub.store)));
+  admin.put('/admin/access-identity',(req,res)=>res.json(configureIdentity(hub,req.body)));
   admin.post('/admin/tunnel/start',asyncRoute(async(req,res)=>res.json(await tunnels.start(req.body.connectorToken))));
   admin.post('/admin/tunnel/stop',asyncRoute(async(req,res)=>res.json(await tunnels.stop())));
   admin.post('/admin/tunnel/ngrok/token',(req,res)=>res.json(tunnels.setNgrokToken(req.body.authtoken)));
@@ -141,20 +144,29 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
   gateway.get('/health',(req,res)=>res.json({service:'LineBridge',version:VERSION,status:'running'}));
   gateway.use(asyncRoute(async(req,res,next)=>{
     const c=tunnels.config();
-    const header=req.headers.authorization;
-    req.actor=header===undefined&&directLocalRequest(req,gatewayPort,c.provider,requireToken)?localActor:hub.authenticate(header?.startsWith('Bearer ')?header.slice(7):undefined);
-    // Managed credentials are valid only on a direct server-side loopback
-    // connection, even if a tunnel is configured or its proxy spoofs Host.
-    if(req.actor.localOnly&&!directLocalRequest(req,gatewayPort,'local'))fail(403,'local_profile_only','This managed profile is limited to direct local AI clients.');
-    // Once configured, enforce Access on ALL gateway requests, independent of spoofable Host/forwarding headers.
-    if(c.provider==='cloudflare' && c.hostname&&!req.actor.localOnly) {
+    const header=req.headers.authorization,bearer=header?.startsWith('Bearer ')?header.slice(7):undefined;
+    const cloud=c.provider==='cloudflare'&&!!c.hostname,assertion=req.headers['cf-access-jwt-assertion'];
+    const verifyAccess=async()=>{
       if(!c.teamDomain||!c.audience)fail(503,'access_not_configured','Cloudflare Access must be configured before remote access.');
-      const assertion=req.headers['cf-access-jwt-assertion'];
       if(typeof assertion!=='string')fail(401,'cloudflare_access_required','Cloudflare Access authentication is required in addition to a LINE Bridge Bearer token.');
       const issuer=`https://${c.teamDomain}`;
       if(accessIssuer!==issuer){accessIssuer=issuer;accessKeyset=createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`),{timeoutDuration:5000});}
-      try{await jwtVerify(assertion,accessKeyset,{issuer,audience:c.audience,algorithms:['RS256']});tunnels.accessLastValidated=new Date().toISOString();}
+      let payload;
+      try{({payload}=await jwtVerify(assertion,accessKeyset,{issuer,audience:c.audience,algorithms:['RS256']}));}
       catch{fail(401,'invalid_access_assertion','Cloudflare Access authentication failed.');}
+      tunnels.accessLastValidated=new Date().toISOString();return payload;
+    };
+    if(cloud&&identityEnabled(hub.store)&&typeof assertion==='string'&&!bearer?.startsWith('lb_')){
+      // An OAuth-only client (ChatGPT, Dot) signed in through Access Managed OAuth.
+      // It carries no LineBridge token; Cloudflare's signed assertion names the person.
+      req.actor=identityActor(hub,await verifyAccess());
+    }else{
+      req.actor=header===undefined&&directLocalRequest(req,gatewayPort,c.provider,requireToken)?localActor:hub.authenticate(bearer);
+      // Managed credentials are valid only on a direct server-side loopback
+      // connection, even if a tunnel is configured or its proxy spoofs Host.
+      if(req.actor.localOnly&&!directLocalRequest(req,gatewayPort,'local'))fail(403,'local_profile_only','This managed profile is limited to direct local AI clients.');
+      // Once configured, enforce Access on ALL gateway requests, independent of spoofable Host/forwarding headers.
+      if(cloud&&!req.actor.localOnly)await verifyAccess();
     }
     if(!hub.store.setting('aiEnabled',true))fail(503,'gateway_paused','The user has paused AI access.');
     // A supplied credential is always validated; invalid credentials never

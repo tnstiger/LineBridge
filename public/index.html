@@ -226,6 +226,15 @@
             <label class="field"><span>連接器權杖</span><input name="connectorToken" type="password" autocomplete="off" placeholder="留空則使用已保存的權杖"></label>
           </details>
 
+          <details class="disclosure" id="access-identity">
+            <summary>Cloudflare 登入（ChatGPT／Dot 等 OAuth 用戶端）</summary>
+            <p class="muted">Access 應用程式需開啟 Managed OAuth。名單內的人透過 Cloudflare 登入後，取得所選 AI 權杖的權限，不需另附 Bearer 權杖。</p>
+            <label class="field"><span>允許登入的 email</span><textarea id="identity-emails" rows="2" autocomplete="off" placeholder="you@example.com，多個以逗號或換行分隔"></textarea></label>
+            <label class="field"><span>套用的 AI 權杖範圍</span><select id="identity-token"></select></label>
+            <div class="btn-row"><button class="btn" type="button" id="save-identity">儲存登入設定</button><button class="btn ghost" type="button" id="clear-identity">停用</button></div>
+            <p class="muted form-status" id="identity-status"></p>
+          </details>
+
           <div class="form-actions">
             <button class="btn primary" type="button" id="start-tunnel" data-icon="play">啟動</button>
             <button class="btn" type="button" id="stop-tunnel">停止</button>
