@@ -3,12 +3,16 @@ import {fail} from './errors.mjs';
 
 export const MEDIA_MAX_BYTES=1024*1024;
 export const MEDIA_TIMEOUT_MS=25000;
+// Files are larger than chat media; the private worker pipe line limit is sized for
+// a base64 reply of this size. Larger files are refused rather than truncated.
+export const FILE_MAX_BYTES=10*1024*1024;
+export const FILE_TIMEOUT_MS=60000;
 // Pinned SDK encryptByKeyMaterial appends HMAC-SHA256(ciphertext, macKey),
 // but its decrypt helper never verifies it. Authenticate before decrypting.
-export async function decryptAuthenticatedMedia(e2ee,input,keyMaterial){
+export async function decryptAuthenticatedMedia(e2ee,input,keyMaterial,max=MEDIA_MAX_BYTES){
   const bytes=Buffer.from(input);
   const key=typeof keyMaterial==='string'?Buffer.from(keyMaterial,'base64'):Buffer.from(keyMaterial??[]);
-  if(bytes.length<=32||bytes.length>MEDIA_MAX_BYTES||key.length!==32)fail(502,'media_integrity_failed','Encrypted media integrity could not be verified.');
+  if(bytes.length<=32||bytes.length>max+32||key.length!==32)fail(502,'media_integrity_failed','Encrypted media integrity could not be verified.');
   const keys=await e2ee.deriveKeyMaterial(key),ciphertext=bytes.subarray(0,-32),mac=bytes.subarray(-32);
   const expected=createHmac('sha256',keys.macKey).update(ciphertext).digest();
   if(!timingSafeEqual(mac,expected))fail(502,'media_integrity_failed','Encrypted media integrity could not be verified.');
@@ -18,6 +22,13 @@ export function mediaDescriptor(raw){
   const type=String(raw.contentType),m=raw.contentMetadata??{};
   if(type==='IMAGE'||type==='1')return {kind:'image',encrypted:!!raw.chunks?.length};
   if(type==='AUDIO'||type==='3')return {kind:'audio',encrypted:!!raw.chunks?.length};
+  if(type==='FILE'||type==='14'){
+    // Letter Sealed files keep their name inside the encrypted chunks; only plain
+    // transport files expose FILE_NAME/FILE_SIZE here.
+    const result={kind:'file',encrypted:!!raw.chunks?.length},name=safeFileName(m.FILE_NAME);
+    if(name)result.fileName=name;if(typeof m.FILE_SIZE==='string'&&/^\d{1,12}$/.test(m.FILE_SIZE))result.size=Number(m.FILE_SIZE);
+    return result;
+  }
   if(type!=='STICKER'&&type!=='7')return undefined;
   const result={kind:'sticker'};
   for(const [key,name] of [['STKID','stickerId'],['STKPKGID','packageId'],['STKVER','version']])if(typeof m[key]==='string'&&/^\d{1,20}$/.test(m[key]))result[name]=m[key];
@@ -26,7 +37,11 @@ export function mediaDescriptor(raw){
 }
 // Audio archived before audio support has no descriptor, but needs none: the
 // driver re-fetches and re-checks the upstream message before any download.
-export function archivedMedia(message){return message.media??(['AUDIO','3'].includes(String(message.contentType))?{kind:'audio'}:undefined);}
+export function archivedMedia(message){
+  if(message.media)return message.media;
+  const type=String(message.contentType);
+  return ['AUDIO','3'].includes(type)?{kind:'audio'}:['FILE','14'].includes(type)?{kind:'file'}:undefined;
+}
 // LINE labels ordinary stickers with a localized placeholder such as "[Sticker]"
 // or "[スタンプ]" in STKTXT, and STKOPT "0" means no option. Neither changes the
 // image. Any other text or option still marks a custom or option-bearing sticker.
@@ -89,11 +104,37 @@ export function audioResult(input){
   if(!brand||!moov||!mdat)unsupported();
   return {mimeType:/^3g/.test(brand)?'audio/3gpp':'audio/mp4',bytes:bytes.length,...(durationMs!==undefined?{durationMs}:{}),sha256:createHash('sha256').update(bytes).digest('hex'),data:bytes.toString('base64'),untrustedContent:true};
 }
-export async function boundedResponse(response,signal){
+export async function boundedResponse(response,signal,max=MEDIA_MAX_BYTES){
   if(!response.ok){await response.body?.cancel();fail(502,'media_unavailable','LINE media is unavailable, expired, or access was rejected.');}
-  if(Number(response.headers.get('content-length'))>MEDIA_MAX_BYTES){await response.body?.cancel();fail(413,'media_too_large','Media exceeds the 1 MiB limit.');}
+  const tooLarge=()=>fail(413,'media_too_large',max===MEDIA_MAX_BYTES?'Media exceeds the 1 MiB limit.':`File exceeds the ${Math.round(max/1048576)} MiB limit.`);
+  if(Number(response.headers.get('content-length'))>max){await response.body?.cancel();tooLarge();}
   const reader=response.body?.getReader();if(!reader)fail(502,'media_unavailable','Media body is unavailable.');
   const chunks=[];let size=0;
-  try{for(;;){signal?.throwIfAborted();const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>MEDIA_MAX_BYTES)fail(413,'media_too_large','Media exceeds the 1 MiB limit.');chunks.push(Buffer.from(value));}return Buffer.concat(chunks);}
+  try{for(;;){signal?.throwIfAborted();const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>max)tooLarge();chunks.push(Buffer.from(value));}return Buffer.concat(chunks);}
   finally{await reader.cancel().catch(()=>{});}
+}
+
+// A display name only: never a path. Control characters, separators and
+// leading dots are removed; length is bounded in UTF-16 units.
+export function safeFileName(value){
+  if(typeof value!=='string')return '';
+  const name=value.normalize('NFC').replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069\/\\:*?"<>|]/g,'_').replace(/^[.\s]+/,'').trim().slice(0,200);
+  return name;
+}
+const EXTENSION_TYPES={pdf:'application/pdf',txt:'text/plain',csv:'text/csv',json:'application/json',md:'text/markdown',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',heic:'image/heic',zip:'application/zip',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',doc:'application/msword',xls:'application/vnd.ms-excel',ppt:'application/vnd.ms-powerpoint',mp4:'video/mp4',mov:'video/quicktime',m4a:'audio/mp4',mp3:'audio/mpeg'};
+// Content sniffing first; the extension only refines generic containers.
+export function fileMimeType(bytes,name=''){
+  const ext=String(name).toLowerCase().split('.').at(-1),head=bytes.subarray(0,8);
+  if(head.toString('latin1',0,5)==='%PDF-')return 'application/pdf';
+  if(head.equals(Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a])))return 'image/png';
+  if(head[0]===0xff&&head[1]===0xd8&&head[2]===0xff)return 'image/jpeg';
+  if(head.toString('latin1',0,4)==='PK\x03\x04')return ['docx','xlsx','pptx','zip'].includes(ext)?EXTENSION_TYPES[ext]:'application/zip';
+  return EXTENSION_TYPES[ext]??'application/octet-stream';
+}
+export function fileResult(input,name){
+  const bytes=Buffer.from(input);
+  if(!bytes.length)fail(502,'media_unavailable','The file is empty or could not be retrieved.');
+  if(bytes.length>FILE_MAX_BYTES)fail(413,'media_too_large',`File exceeds the ${FILE_MAX_BYTES/1048576} MiB limit.`);
+  const fileName=safeFileName(name)||'file';
+  return {fileName,mimeType:fileMimeType(bytes,fileName),bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),data:bytes.toString('base64'),untrustedContent:true};
 }

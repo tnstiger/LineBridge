@@ -11,7 +11,8 @@ import {ACCOUNT_CHECK_TIMEOUT_MS,ACCOUNT_CHECK_INTERVAL_MS,accountDiagnostic,acc
 import {refreshIntervalSeconds,MIN_REFRESH_INTERVAL_SECONDS,MAX_REFRESH_INTERVAL_SECONDS} from './monitor-policy.mjs';
 import {DebugLogging} from './debug-logging.mjs';
 import {validateFlex,assertFlexTransport} from './flex.mjs';
-import {imageResult,audioResult,archivedMedia} from './media.mjs';
+import {imageResult,audioResult,fileResult,safeFileName,archivedMedia,FILE_MAX_BYTES} from './media.mjs';
+import {extractFileText} from './file-text.mjs';
 import {MAX_SCOPE_CHATS} from './limits.mjs';
 
 const accountInput=z.object({label:z.string().trim().min(1).max(80),kind:z.enum(['line','demo']).default('line'),device:z.enum(['IOSIPAD','DESKTOPWIN','ANDROIDSECONDARY']).default('IOSIPAD')}).strict();
@@ -306,19 +307,35 @@ export class Hub {
       const row=this.store.db.prepare('SELECT event_id,cipher FROM messages WHERE account_id=? AND chat_id=? AND message_id=?').get(id,chatId,messageId);
       if(!row)fail(404,'media_not_archived','Media retrieval requires a message captured in this designated chat archive.');
       const message=this.vault.unseal(row.cipher,`message:${row.event_id}`),media=archivedMedia(message);
-      if(!media)fail(409,'media_metadata_missing','This archived message has no image, sticker or audio descriptor; legacy records are not silently refetched.');
-      if(kinds&&!kinds.includes(media.kind))fail(415,'media_kind_mismatch',media.kind==='audio'?'This message is audio. Use line_read_audio or the media API.':'This message is not audio. Use line_read_image or the media API.');
+      if(!media)fail(409,'media_metadata_missing','This archived message has no image, sticker, audio or file descriptor; legacy records are not silently refetched.');
+      if(kinds&&!kinds.includes(media.kind))fail(415,'media_kind_mismatch',media.kind==='audio'?'This message is audio. Use line_read_audio or the media API.':media.kind==='file'?'This message is a file. Use line_read_file or the media API.':kinds.includes('file')?'This message is not a file. Use line_read_image or line_read_audio.':'This message is not audio. Use line_read_image or the media API.');
       const driver=this.driver(id);if(!driver.media)fail(415,'media_unsupported','This account adapter does not support media.');
       try{
         const result=await driver.media(chat,{...message,media});
         this.authorize(actor,id,'read',chatId);
         // Validate the private worker boundary as well as upstream bytes.
         const data=Buffer.from(result.data??'','base64');
-        const checked=media.kind==='audio'?{kind:'audio',...audioResult(data)}:{kind:'image',...imageResult(data,result.preview===true)};
-        this.store.audit(actor.id,'media.read',id,chatId,'ok');
+        const checked=media.kind==='file'?{kind:'file',...fileResult(data,result.fileName)}:media.kind==='audio'?{kind:'audio',...audioResult(data)}:{kind:'image',...imageResult(data,result.preview===true)};
+        this.store.audit(actor.id,media.kind==='file'?'file.read':'media.read',id,chatId,'ok');
         return {accountId:id,chatId,messageId,...checked,...(result.preview?{notice:'Static preview; animation, sound and custom text are not interpreted.'}:{}),retention:'No server media cache; bytes live only for this request.'};
-      }catch(error){this.store.audit(actor.id,'media.read',id,chatId,'failed');throw error;}
+      }catch(error){this.store.audit(actor.id,media.kind==='file'?'file.read':'media.read',id,chatId,'failed');throw error;}
     });
+  }
+  // A file plus readable text for AI clients. The text is untrusted chat content.
+  async readFile(actor,id,chatId,messageId){
+    const result=await this.media(actor,id,chatId,messageId,{kinds:['file']});
+    const text=await extractFileText(Buffer.from(result.data,'base64'),result.mimeType);
+    return {...result,...text};
+  }
+  // Sends one file. Input: {fileName, data(base64)}; mimeType is advisory only.
+  async sendFile(actor,id,chatId,input,key){
+    this.authorize(actor,id,'send',chatId);
+    const fileName=safeFileName(input?.fileName),data=typeof input?.data==='string'?input.data:'';
+    if(!fileName)fail(400,'invalid_file_name','Supply a file name.');
+    if(!data||!/^[A-Za-z0-9+/]+={0,2}$/.test(data))fail(400,'invalid_file','Supply the file content as base64.');
+    const bytes=Buffer.from(data,'base64');
+    if(!bytes.length||bytes.length>FILE_MAX_BYTES)fail(413,'file_too_large',`Files must be 1 byte to ${FILE_MAX_BYTES/1048576} MiB.`);
+    return this.send(actor,id,chatId,{fileName,data:bytes.toString('base64'),sha256:createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length},key,'file');
   }
   async sendFlex(actor,id,chatId,input,key){
     this.authorize(actor,id,'send',chatId);
@@ -335,14 +352,14 @@ export class Hub {
   async send(actor,id,chatId,text,key,kind='text',options={}) {
     this.authorize(actor,id,'send',chatId);this.limit(actor,true);
     if(options.acknowledgeOaTransport!==undefined&&typeof options.acknowledgeOaTransport!=='boolean')fail(400,'invalid_input','acknowledgeOaTransport must be a boolean.');
-    if(!['text','flex'].includes(kind))fail(400,'invalid_input','Unsupported message kind.');
+    if(!['text','flex','file'].includes(kind))fail(400,'invalid_input','Unsupported message kind.');
     if(kind==='text'&&(typeof text!=='string'||!text.trim()||text.length>5000))fail(400,'invalid_text','A text message of 1–5000 characters is required.');
     if(kind==='flex'){text=validateFlex(text);assertFlexTransport(this.authorize(actor,id,'send',chatId));}
     if(typeof key!=='string'||!/^[A-Za-z0-9._:-]{8,128}$/.test(key))fail(400,'idempotency_required','Supply a unique idempotency key of 8–128 letters, digits, dots, underscores, colons or hyphens.');
     return this.serialized(id,async()=>{
       const chat=this.authorize(actor,id,'send',chatId),driver=this.driver(id);
       if(kind==='flex')assertFlexTransport(chat);
-      const fingerprint=createHmac('sha256',this.vault.key).update(JSON.stringify(kind==='text'?(options.acknowledgeOaTransport===true?[id,chatId,text,'oa-transport-acknowledged']:[id,chatId,text]):[id,chatId,'flex',text])).digest('hex');
+      const fingerprint=createHmac('sha256',this.vault.key).update(JSON.stringify(kind==='text'?(options.acknowledgeOaTransport===true?[id,chatId,text,'oa-transport-acknowledged']:[id,chatId,text]):kind==='file'?[id,chatId,'file',text.fileName,text.sha256]:[id,chatId,'flex',text])).digest('hex');
       const previous=this.store.send(actor.id,key);
       if(previous) {
         if(previous.fingerprint!==fingerprint)fail(409,'idempotency_conflict','This key was already used for a different message.');
@@ -353,17 +370,21 @@ export class Hub {
       this.store.reserve(actor.id,key,fingerprint);
       try {
         if(kind==='flex'&&!driver.sendFlex)throw new SendRejectedError(409,'flex_transport_unverified','This adapter does not support Flex sending.');
-        const result={accountId:id,chatId,...await (kind==='flex'?driver.sendFlex(chat,text):driver.send(chat,text,options,()=>{
+        if(kind==='file'&&!driver.sendFile)throw new SendRejectedError(409,'file_send_unsupported','This adapter does not support file sending.');
+        const authorizeDispatch=()=>{
+          try{if(this.stopping)throw new Error();this.authorize(actor,id,'send',chatId);}catch{throw new SendRejectedError(403,'send_authorization_revoked','Send permission changed or the service stopped during preparation. No message was sent.');}
+        };
+        const result={accountId:id,chatId,...await (kind==='flex'?driver.sendFlex(chat,text):kind==='file'?driver.sendFile(chat,{fileName:text.fileName,data:text.data},authorizeDispatch):driver.send(chat,text,options,()=>{
           try{if(this.stopping)throw new Error();this.authorize(actor,id,'send',chatId);}catch{throw new SendRejectedError(403,'send_authorization_revoked','Send permission changed or the service stopped during preparation. No message was sent.');}
         })),replayed:false};
-        this.store.finishSend(actor.id,key,'sent',result);this.store.audit(actor.id,'messages.send',id,chatId,'ok');
+        this.store.finishSend(actor.id,key,'sent',result);this.store.audit(actor.id,kind==='file'?'file.send':'messages.send',id,chatId,'ok');
         if(this.record(id).kind==='demo'&&kind==='text')try{this.capture(id,chatId,{id:result.messageId,senderId:'synthetic',senderName:'Sample account',text,timestamp:result.timestamp,contentType:'NONE'});}catch{this.store.audit(actor.id,'monitor.capture',id,chatId,'failed');}
         this.runtime.get(id).lastActivity=new Date().toISOString();return result;
       }catch(error){
         if(error instanceof SendRejectedError) {
-          this.store.finishSend(actor.id,key,'rejected',publicError(error));this.store.audit(actor.id,'messages.send',id,chatId,'rejected');throw error;
+          this.store.finishSend(actor.id,key,'rejected',publicError(error));this.store.audit(actor.id,kind==='file'?'file.send':'messages.send',id,chatId,'rejected');throw error;
         }
-        this.store.finishSend(actor.id,key,'unknown');this.store.audit(actor.id,'messages.send',id,chatId,'unknown');fail(502,'delivery_unknown','The send outcome is unknown. It was not retried. Inspect the chat before another send.');
+        this.store.finishSend(actor.id,key,'unknown');this.store.audit(actor.id,kind==='file'?'file.send':'messages.send',id,chatId,'unknown');fail(502,'delivery_unknown','The send outcome is unknown. It was not retried. Inspect the chat before another send.');
       }
     });
   }

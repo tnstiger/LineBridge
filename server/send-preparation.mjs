@@ -16,7 +16,11 @@ export class PreparationFailure extends Error {
 
 // Per-operation views preserve SDK behavior and shared live clients. Do not
 // monkeypatch the live SDK, add key registration, retry, or change encryption.
-export async function prepareText(client,chat,text,negotiation){
+export function prepareText(client,chat,text,negotiation){return prepareSealed(client,chat,text,'NONE',negotiation);}
+// Files seal {keyMaterial,fileName} with contentType FILE through the same
+// existing-key view: no key registration, retry or encryption downgrade.
+export function prepareFile(client,chat,keyMaterial,fileName,negotiation){return prepareSealed(client,chat,{keyMaterial,fileName},14,negotiation);}
+async function prepareSealed(client,chat,data,contentType,negotiation){
   let stage='MESSAGE_PREPARATION';
   const failures=new WeakMap();
   const e2ee=existingKeyE2EE(client),view=Object.create(client),talk=Object.create(client.talk);
@@ -37,6 +41,6 @@ export async function prepareText(client,chat,text,negotiation){
   if(negotiation!==undefined)talk.negotiateE2EEPublicKey=async()=>{stage='RECIPIENT_KEY_NEGOTIATION';return negotiation;};
   wrap(talk,client.talk,'getLastE2EEGroupSharedKey','GROUP_KEY_LOOKUP',client.talk);
   wrap(e2ee,client.e2ee,'encryptE2EETextMessage','ENCRYPTION');
-  try{return await e2ee.encryptE2EEMessage(chat.id,text,'NONE');}
+  try{return await e2ee.encryptE2EEMessage(chat.id,data,contentType);}
   catch(error){throw new PreparationFailure(error&&typeof error==='object'?failures.get(error)??stage:stage,error);}
 }

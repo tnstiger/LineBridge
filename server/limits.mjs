@@ -7,3 +7,11 @@ export const MAX_SCOPE_CHATS=10000;
 // and the current list). LINE IDs are 33 characters, so 32 KB failed at about
 // 450 chats. Two lists at the cap stay far below this size.
 export const ADMIN_JSON_LIMIT='2mb';
+
+// One JSON line on the private worker pipe. A 10 MiB file is about 14 MB as
+// base64; this leaves room for metadata without allowing unbounded lines.
+export const WORKER_LINE_MAX=16_000_000;
+
+// Gateway request bodies. A file sent inline as base64 needs the same headroom.
+// Authentication runs before the body is parsed.
+export const GATEWAY_JSON_LIMIT='16mb';

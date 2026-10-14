@@ -12,7 +12,7 @@ import {Cloudflare,CALLBACK} from './cloudflare.mjs';
 import {VERSION} from './version.mjs';
 import {LocalSetup} from './local-setup.mjs';
 import {ChatAccess} from './chat-access.mjs';
-import {ADMIN_JSON_LIMIT} from './limits.mjs';
+import {ADMIN_JSON_LIMIT,GATEWAY_JSON_LIMIT} from './limits.mjs';
 import {identityConfig,identityEnabled,configureIdentity,identityActor} from './access-identity.mjs';
 
 function freshQuery(req){if(req.query.fresh===undefined)return false;if(!['true','false'].includes(req.query.fresh))fail(400,'invalid_input','fresh must be true or false.');return req.query.fresh==='true';}
@@ -181,7 +181,7 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
     // silently fall back to the VM's local permissions.
     hub.limit(req.actor);next();
   }));
-  gateway.use(express.json({limit:'32kb'}));
+  gateway.use(express.json({limit:GATEWAY_JSON_LIMIT}));
   gateway.use(admission);
   gateway.get('/api/v1/version',(req,res)=>res.json({service:'LineBridge',version:VERSION}));
   gateway.get('/api/v1/status',(req,res)=>res.json({enabled:true,authentication:req.actor.local?'local':'token',accounts:hub.accounts(req.actor),setup:{dashboard:`http://127.0.0.1:${adminPort}`,mcp:`http://127.0.0.1:${gatewayPort}/mcp`,steps:['Pair your LINE account by scanning its QR code on your phone.','Designate chats, enable monitoring and create a scoped AI token.','Start a tunnel on this PC and connect your cloud AI with its HTTPS URL and token.']}}));
@@ -193,6 +193,7 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
   gateway.post('/api/v1/accounts/:id/chats/:chatId/messages',asyncRoute(async(req,res)=>res.json(await hub.send(req.actor,req.params.id,req.params.chatId,req.body.text,req.headers['idempotency-key'],'text',{acknowledgeOaTransport:req.body.acknowledgeOaTransport}))));
   gateway.get('/openapi.json',(req,res)=>res.json(openapi));
   gateway.get('/api/v1/accounts/:id/chats/:chatId/messages/:messageId/media',asyncRoute(async(req,res)=>{res.set('Cache-Control','no-store');res.json(await hub.media(req.actor,req.params.id,req.params.chatId,req.params.messageId));}));
+  gateway.post('/api/v1/accounts/:id/chats/:chatId/files',asyncRoute(async(req,res)=>res.json(await hub.sendFile(req.actor,req.params.id,req.params.chatId,{fileName:req.body?.fileName,data:req.body?.dataBase64},req.headers['idempotency-key']))));
   gateway.post('/api/v1/accounts/:id/chats/:chatId/flex',asyncRoute(async(req,res)=>res.json(await hub.sendFlex(req.actor,req.params.id,req.params.chatId,req.body,req.headers['idempotency-key']))));
   gateway.post('/mcp',asyncRoute((req,res)=>mcpHandler(hub,req,res)));
   gateway.all('/mcp',(req,res)=>res.status(405).json({error:'method_not_allowed',message:'Use stateless Streamable HTTP POST.'}));

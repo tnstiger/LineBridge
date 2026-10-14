@@ -1,3 +1,4 @@
+import {WORKER_LINE_MAX} from './limits.mjs';
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {randomUUID} from 'node:crypto';
@@ -24,7 +25,7 @@ export class ProtocolWorker {
     const input=createInterface({input:child.stdout,crlfDelay:Infinity});
     input.on('line',line=>{
       if(this.child!==child)return;
-      if(line.length>2_000_000){child.kill();return;}
+      if(line.length>WORKER_LINE_MAX){child.kill();return;}
       try{this.handle(decode(line));}catch{child.kill();}
     });
     // exit can precede the final stdout data. Keep the parser, pending RPCs and
@@ -53,7 +54,7 @@ export class ProtocolWorker {
       let ok=false;
       // Bind authorization to a still-pending send; expired/cancelled operations
       // cannot dispatch later. The callback rechecks current parent-owned scope.
-      if(request?.method==='send'&&request.beforeDispatch){try{request.beforeDispatch();ok=true;}catch{}}
+      if(['send','send_file'].includes(request?.method)&&request.beforeDispatch){try{request.beforeDispatch();ok=true;}catch{}}
       this.write({type:'authorize_send_ack',id:message.id,ok});
     }else if(message.type==='event'){
       const emit=this.events.get(message.accountId);if(message.event==='monitor_status')emit?.monitor?.(message.value);else emit?.[message.event]?.(message.value);
@@ -97,10 +98,11 @@ export class ProtocolWorker {
       async login(qr){const profile=await worker.call('connect',{accountId:id,account,storage:storage.getAll(),qr},240000);this.ready=true;return profile;},
       check:signal=>worker.call('check',{accountId:id},ACCOUNT_CHECK_TIMEOUT_MS+5000,signal),discover:()=>call('discover'),
       read:(chat,limit,cursor)=>call('read',{chat,limit,cursor}),
-      media:(chat,message)=>call('media',{chat,message}),
+      media:(chat,message)=>worker.call('media',{accountId:id,chat,message},message?.media?.kind==='file'||['FILE','14'].includes(String(message?.contentType))?90000:40000),
       sendFlex:(chat,input)=>call('send_flex',{chat,input}),
       textCapability:chat=>call('text_capability',{chat}),
       send:(chat,text,options,beforeDispatch)=>worker.call('send',{accountId:id,chat,text,options},40000,undefined,beforeDispatch),
+      sendFile:(chat,input,beforeDispatch)=>worker.call('send_file',{accountId:id,chat,input},90000,undefined,beforeDispatch),
       resolveMessageNames:(chat,messages)=>call('resolve_names',{chat,messages}),
       startMonitor:(chats,reset,refreshIntervalMs)=>call('monitor_start',{chats,reset,refreshIntervalMs}),
       setRefreshInterval:refreshIntervalMs=>call('monitor_interval',{refreshIntervalMs}),

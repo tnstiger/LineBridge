@@ -5,10 +5,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { fail, SendRejectedError } from './errors.mjs';
 import {AliasResolver,contactName} from './aliases.mjs';
 import {ACCOUNT_CHECK_TIMEOUT_MS,accountCheckError,accountDiagnostic} from './account-health.mjs';
-import {mediaDescriptor,archivedMedia,basicSticker,imageResult,audioResult,boundedResponse,decryptAuthenticatedMedia,MEDIA_TIMEOUT_MS} from './media.mjs';
+import {mediaDescriptor,archivedMedia,basicSticker,imageResult,audioResult,fileResult,safeFileName,boundedResponse,decryptAuthenticatedMedia,MEDIA_TIMEOUT_MS,MEDIA_MAX_BYTES,FILE_MAX_BYTES,FILE_TIMEOUT_MS} from './media.mjs';
 import {assertFlexTransport,validateFlex} from './flex.mjs';
 import {officialAccountCapability,OA_NOTICE} from './official-account.mjs';
-import {prepareText} from './send-preparation.mjs';
+import {prepareText,prepareFile} from './send-preparation.mjs';
 import {dispatchText} from './send-dispatch.mjs';
 import {guardRpcTransport} from './rpc-transport.mjs';
 import {existingKeyE2EE} from './encryption-policy.mjs';
@@ -180,9 +180,9 @@ export class LineDriver {
     return {messages:await this.resolveMessageNames(chat,messages.sort((a,b)=>String(a.timestamp).localeCompare(String(b.timestamp)))),cursor:null,coverage:'Recent messages returned by LINE; full historical sync is not supported.'};
   }
   async media(chat,message) {
-    const deadline=AbortSignal.any([this.abort.signal,AbortSignal.timeout(MEDIA_TIMEOUT_MS)]);
+    const media=archivedMedia(message),isFile=media?.kind==='file',max=isFile?FILE_MAX_BYTES:MEDIA_MAX_BYTES;
+    const deadline=AbortSignal.any([this.abort.signal,AbortSignal.timeout(isFile?FILE_TIMEOUT_MS:MEDIA_TIMEOUT_MS)]);
     return this.monitorRequest(deadline,async()=>{
-      const media=archivedMedia(message);
       if(!media)fail(409,'media_metadata_missing','This archived message predates media metadata support. Legacy metadata is not automatically reconstructed.');
       if(media.kind==='sticker'){
         if(!basicSticker(media))fail(415,'sticker_unsupported','Only basic sticker previews with validated IDs are supported; custom-text or option-bearing stickers are not rendered.');
@@ -190,8 +190,8 @@ export class LineDriver {
         const response=await fetch(url,{redirect:'error',signal:deadline});
         return {...imageResult(await boundedResponse(response,deadline),true),notice:'Static sticker preview only; animation, sound and custom text are not interpreted.'};
       }
-      const types={image:['IMAGE','1'],audio:['AUDIO','3']}[media.kind];
-      if(!types)fail(415,'media_unsupported','This message is not a supported image or audio message.');
+      const types={image:['IMAGE','1'],audio:['AUDIO','3'],file:['FILE','14']}[media.kind];
+      if(!types)fail(415,'media_unsupported','This message is not a supported image, audio or file message.');
       // Isolated SDK OBS adapter: no credential-bearing redirects, arbitrary paths,
       // filenames, unbounded blob() calls, or mutation of the live client fetch.
       // The SDK may register a missing group key from its read helper. Shadow
@@ -199,12 +199,12 @@ export class LineDriver {
       // keys or mutate the shared client's encryption behavior.
       const readE2ee=Object.create(this.client.e2ee);
       readE2ee.tryRegisterE2EEGroupKey=readE2ee.registerE2EEKeyPair=()=>fail(409,'media_key_unavailable','An existing decryption key is required; media reads never register keys.');
-      readE2ee.decryptByKeyMaterial=(bytes,key)=>decryptAuthenticatedMedia(readE2ee,bytes,key);
+      readE2ee.decryptByKeyMaterial=(bytes,key)=>decryptAuthenticatedMedia(readE2ee,bytes,key,max);
       const obs=new this.client.obs.constructor({authToken:this.client.authToken,request:this.client.request,e2ee:readE2ee,fetch:async(info,init)=>{
         const req=new Request(info,init),url=new URL(req.url);
         if(url.origin!=='https://obs.line-apps.com'||!/^\/r\/(?:talk|g2)\/[A-Za-z0-9_./-]+$/.test(url.pathname)||url.search||url.hash||url.username||url.password||req.method!=='GET')fail(415,'media_unsupported','Unsupported media resource.');
         const response=await fetch(new Request(req,{redirect:'error',signal:deadline}));
-        return new Response(await boundedResponse(response,deadline),{headers:response.headers});
+        return new Response(await boundedResponse(response,deadline,max+32),{headers:response.headers});
       }});
       let file;
       if(chat.kind==='openchat')file=await obs.downloadMessageData({messageId:message.id,isSquare:true});
@@ -212,14 +212,15 @@ export class LineDriver {
         const response=await this.client.request.request([[11,2,chat.id],[8,3,100]],'getRecentMessagesV2',4,false,'/S4');
         const raw=Array.isArray(response)?response.map(item=>this.client.thrift.rename_thrift('Message',item)).find(m=>String(m.id)===message.id):null;
         if(!raw)fail(409,'media_history_unavailable','Media is outside the latest 100 upstream messages; encrypted metadata is not retained.');
-        if(!types.includes(String(raw.contentType)))fail(415,'media_unsupported',`Upstream message is not ${media.kind==='audio'?'audio':'an image'}.`);
+        if(!types.includes(String(raw.contentType)))fail(415,'media_unsupported',`Upstream message is not ${({audio:'audio',file:'a file'})[media.kind]??'an image'}.`);
         if(raw.chunks?.length){
           if(!/^[A-Za-z0-9_-]{1,150}$/.test(raw.contentMetadata?.OID??'')||!/^[A-Za-z0-9_-]{1,80}$/.test(raw.contentMetadata?.SID??''))fail(415,'media_unsupported','Encrypted media locator is unavailable or unsupported.');
           file=await obs.downloadMediaByE2EE(raw);
         }else file=await obs.downloadMessageData({messageId:message.id});
       }
       if(!file)fail(502,'media_unavailable','Media could not be retrieved or decrypted.');
-      return media.kind==='audio'?audioResult(await file.arrayBuffer()):imageResult(await file.arrayBuffer());
+      const bytes=await file.arrayBuffer();
+      return media.kind==='file'?fileResult(bytes,file.name||media.fileName):media.kind==='audio'?audioResult(bytes):imageResult(bytes);
     });
   }
   async sendFlex(chat,input) {
@@ -280,6 +281,43 @@ export class LineDriver {
     if(!message?.id) fail(502,'send_unconfirmed','LINE did not return a message ID. Delivery is unknown; inspect the chat before sending again.');
     return {messageId:String(message.id),timestamp:normalizeMessage(message).timestamp,delivery:'accepted_by_line',protection,...(officialAccount?{notice:OA_NOTICE}:{})};
   }
+  // Files are sent only with Letter Sealing: the bytes are encrypted locally with
+  // a fresh key, uploaded as an opaque object, then announced in a sealed FILE
+  // message. Key lookups use existing keys only; there is no plain-transport
+  // fallback. Nothing is visible to recipients until the final message RPC.
+  async sendFile(chat,input,beforeDispatch=()=>{}) {
+    if(chat.kind==='openchat')throw new SendRejectedError(409,'file_send_unsupported','Sending files to OpenChat is not supported. No file was sent.');
+    const bytes=Buffer.from(String(input?.data??''),'base64'),fileName=safeFileName(input?.fileName)||'file';
+    if(!bytes.length||bytes.length>FILE_MAX_BYTES)throw new SendRejectedError(413,'file_too_large',`Files must be 1 byte to ${FILE_MAX_BYTES/1048576} MiB. No file was sent.`);
+    let keyMaterial,encryptedData,chunks;
+    try{
+      const e2ee=existingKeyE2EE(this.client);
+      ({keyMaterial,encryptedData}=await e2ee.encryptByKeyMaterial(bytes));
+      chunks=await prepareFile(this.client,chat,keyMaterial,fileName);
+    }catch(preparation){
+      throw new SendRejectedError(502,'send_preparation_failed',`File preparation failed (${preparation.diagnostic??'FILE_PREPARATION_SDK_ERROR'}). No file was sent. Files are sent only with Letter Sealing; do not reset keys or weaken encryption.`);
+    }
+    let objId;
+    try{
+      await beforeDispatch();
+      ({objId}=await this.monitorRequest(AbortSignal.timeout(FILE_TIMEOUT_MS),()=>this.client.obs.uploadObjectForService({data:new Blob([encryptedData]),oType:'file',obsPath:`talk/emf/reqid-${randomUUID()}`,params:{type:'file'}})));
+    }catch(error){
+      if(error instanceof SendRejectedError)throw error;
+      throw new SendRejectedError(502,'file_upload_failed','The encrypted file upload failed. No message was sent.');
+    }
+    if(!/^[A-Za-z0-9_-]{1,150}$/.test(String(objId??'')))throw new SendRejectedError(502,'file_upload_failed','LINE did not return a valid object ID. No message was sent.');
+    let message;
+    try{
+      message=await dispatchText(this.client,chat,{to:chat.id,chunks,contentType:14,contentMetadata:{SID:'emf',OID:String(objId),FILE_SIZE:String(encryptedData.length),e2eeVersion:'2'}},beforeDispatch);
+    }catch(error){
+      if(error instanceof SendRejectedError)throw error;
+      const code=discoveryErrorCode(error);
+      if(error?.name==='RequestError'&&code!=='protocol_error'&&code!=='UNKNOWN')throw new SendRejectedError(502,'line_send_rejected',`LINE rejected the file message (${code}). No retry was attempted.`);
+      throw error;
+    }
+    if(!message?.id)fail(502,'send_unconfirmed','LINE did not return a message ID. Delivery is unknown; inspect the chat before sending again.');
+    return {messageId:String(message.id),timestamp:normalizeMessage(message).timestamp,delivery:'accepted_by_line',protection:'letter_sealing',fileName,bytes:bytes.length};
+  }
 }
 
 export class DemoDriver {
@@ -295,6 +333,11 @@ export class DemoDriver {
   async check() { return {displayName:'Sample account',mid:'synthetic'}; }
   async discover() { return {chats:this.rooms,warnings:[]}; }
   async read(chat,limit) { return {messages:(this.messages.get(chat.id) ?? []).slice(-limit),cursor:null,coverage:'Synthetic sandbox data. No LINE network calls.'}; }
+  async sendFile(chat,input) {
+    if(chat.kind==='openchat')throw new SendRejectedError(409,'file_send_unsupported','Sending files to OpenChat is not supported. No file was sent.');
+    const bytes=Buffer.from(String(input?.data??''),'base64');
+    return {messageId:`demo-${randomUUID()}`,timestamp:new Date().toISOString(),delivery:'sandbox_only',protection:'letter_sealing',fileName:safeFileName(input?.fileName)||'file',bytes:bytes.length};
+  }
   async send(chat,text) {
     const message={id:`demo-${randomUUID()}`,senderId:'synthetic',text,timestamp:new Date().toISOString(),contentType:'NONE'};
     const list=this.messages.get(chat.id) ?? []; list.push(message);this.messages.set(chat.id,list.slice(-100));
