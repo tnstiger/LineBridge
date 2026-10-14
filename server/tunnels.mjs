@@ -21,6 +21,7 @@ export function tailscaleAuth(value){try{const u=new URL(value);return value.len
 export function publicHostname(value){try{const u=new URL(value);return u.protocol==='https:'&&!u.port&&!u.username&&!u.password&&!u.search&&!u.hash&&u.pathname==='/'&&validHostname(u.hostname)?u.hostname:null;}catch{return null;}}
 const tsPort=c=>c.httpsPort??(c.provider==='tailscale_funnel'?443:8443);
 const routeMatches=(current,route)=>{const handlers=current.Web?.[route.host]?.Handlers;return !!handlers&&Object.keys(handlers).length===1&&handlers['/']?.Proxy===route.proxy&&!!current.AllowFunnel?.[route.host]===route.funnel;};
+const AUTOSTART=new Set(['cloudflare','cloudflare_quick','ngrok']);
 export class Tunnels {
   constructor(store,vault,root,gatewayPort,metricsPort=gatewayPort+1,data=join(root,'data')){
     Object.assign(this,{store,vault,root,gatewayPort,metricsPort,data});this.state={status:'not_started'};this.busy=false;
@@ -147,6 +148,16 @@ export class Tunnels {
     const failed=()=>{if(this.child===child){this.child=null;this.quickHost=null;this.state={status:'connector_failed'};}};child.on('error',failed);child.on('exit',failed);
     return {status:'starting'};
   });}
+  // Remember an explicit start so a service restart brings the connection back.
+  // Only providers that start without user interaction are restored; an
+  // explicit stop, a provider change or a failed restore clears the intent.
+  rememberStart(){const p=this.config().provider;this.store.setSetting('tunnelAutostart',AUTOSTART.has(p)?p:null);}
+  forgetStart(){this.store.setSetting('tunnelAutostart',null);}
+  async restore(){
+    const wanted=this.store.setting('tunnelAutostart',null);
+    if(!wanted||wanted!==this.config().provider||!AUTOSTART.has(wanted))return null;
+    try{return await this.start();}catch{this.state={status:'restore_failed'};return null;}
+  }
   async stop(){return this.operation(async()=>{
     await this.close();
     this.state={status:'stopped'};return this.state;

@@ -85,6 +85,8 @@ export async function startService({dataDir=defaultDataDirectory(),adminPort=Num
     await writeFile(join(data,'server.pid'),String(process.pid),{mode:0o600});
     if(marker)await rm(join(data,MAINTENANCE_FILE));
     process.on('SIGINT',signal);process.on('SIGTERM',signal);initializing=hub.initialize();
+    // Bring back a remote connection the user had started before this restart.
+    void tunnels.restore();
     return {hub,tunnels,adminPort,gatewayPort,dataDir:data,instance,shutdown};
   }catch(error){await shutdown();throw error;}finally{gate.close();}
 }

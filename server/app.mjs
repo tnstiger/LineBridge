@@ -111,11 +111,11 @@ export function createApps({hub,tunnels,root,adminPort=3210,gatewayPort=3211,clo
   admin.post('/admin/tokens',(req,res)=>res.status(201).json(hub.createToken(req.body)));
   admin.put('/admin/tokens/:id/grants',(req,res)=>res.json(hub.updateTokenScope(req.params.id,req.body)));
   admin.delete('/admin/tokens/:id',(req,res)=>{hub.store.revoke(req.params.id);hub.store.audit('local-admin','token.revoke',null,null,'ok');res.json({ok:true});});
-  admin.put('/admin/tunnel',(req,res)=>res.json(tunnels.configure(req.body)));
+  admin.put('/admin/tunnel',(req,res)=>{const before=tunnels.config().provider,result=tunnels.configure(req.body);if(result.provider!==before)tunnels.forgetStart();res.json(result);});
   admin.get('/admin/access-identity',(req,res)=>res.json(identityConfig(hub.store)));
   admin.put('/admin/access-identity',(req,res)=>res.json(configureIdentity(hub,req.body)));
-  admin.post('/admin/tunnel/start',asyncRoute(async(req,res)=>res.json(await tunnels.start(req.body.connectorToken))));
-  admin.post('/admin/tunnel/stop',asyncRoute(async(req,res)=>res.json(await tunnels.stop())));
+  admin.post('/admin/tunnel/start',asyncRoute(async(req,res)=>{const result=await tunnels.start(req.body.connectorToken);if(['running','starting'].includes(result?.status))tunnels.rememberStart();res.json(result);}));
+  admin.post('/admin/tunnel/stop',asyncRoute(async(req,res)=>{tunnels.forgetStart();res.json(await tunnels.stop());}));
   admin.post('/admin/tunnel/ngrok/token',(req,res)=>res.json(tunnels.setNgrokToken(req.body.authtoken)));
   admin.delete('/admin/tunnel/ngrok/token',(req,res)=>res.json(tunnels.forgetNgrokToken()));
   admin.post('/admin/tunnel/install',asyncRoute(async(req,res)=>res.json(await tunnels.install(req.body.provider))));
