@@ -82,12 +82,15 @@ test('unknown send outcomes are retained and never automatically retried',async 
   assert.equal(calls,1);assert.equal(store.send(actor.id,'unknown-send-001').state,'unknown');
   assert.ok(!JSON.stringify(store.audits()).includes('private body'));
 });
-test('rejected sends preserve an actionable error without claiming unknown delivery or retrying',async t=>{
+test('rejected sends preserve an actionable error without claiming unknown delivery, and may be retried',async t=>{
   const {hub,store,account}=await setup(t);let calls=0;
   hub.driver(account.id).send=async()=>{calls++;throw new SendRejectedError(502,'send_preparation_failed','No message was sent.');};
-  for(let i=0;i<2;i++)await assert.rejects(hub.send(adminActor,account.id,'demo-group','hello','rejected-send-001'),{code:'send_preparation_failed'});
+  await assert.rejects(hub.send(adminActor,account.id,'demo-group','hello','rejected-send-001'),{code:'send_preparation_failed'});
   assert.equal(calls,1);assert.equal(store.send(adminActor.id,'rejected-send-001').state,'rejected');
-  hub.driver(account.id).send=async()=>({messageId:'accepted',delivery:'sandbox_only'});
+  // Nothing was sent, so the same key runs again once the cause is fixed.
+  hub.driver(account.id).send=async()=>{calls++;return {messageId:'accepted',delivery:'sandbox_only'};};
+  assert.equal((await hub.send(adminActor,account.id,'demo-group','hello','rejected-send-001')).messageId,'accepted');assert.equal(calls,2);
+  assert.equal(store.send(adminActor.id,'rejected-send-001').state,'sent');
   assert.equal((await hub.send(adminActor,account.id,'demo-group','hello','rejected-send-002')).messageId,'accepted');
 });
 test('credentials are encrypted with account/key binding; token hashes and audit logs exclude secrets',async t=>{

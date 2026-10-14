@@ -364,10 +364,11 @@ export class Hub {
       if(previous) {
         if(previous.fingerprint!==fingerprint)fail(409,'idempotency_conflict','This key was already used for a different message.');
         if(previous.state==='sent')return {...JSON.parse(previous.result),replayed:true};
-        if(previous.state==='rejected') {const e=JSON.parse(previous.result);throw new HubError(e.status,e.code,e.message);}
-        fail(409,'delivery_unknown','This send has an unknown outcome. Inspect the chat before creating another send.');
-      }
-      this.store.reserve(actor.id,key,fingerprint);
+        // A rejection means nothing was sent, so the same request may run again
+        // (for example after a fix). Sent and unknown outcomes are never repeated.
+        if(previous.state!=='rejected')fail(409,'delivery_unknown','This send has an unknown outcome. Inspect the chat before creating another send.');
+        if(!this.store.retryRejected(actor.id,key,fingerprint))fail(409,'delivery_unknown','This send has an unknown outcome. Inspect the chat before creating another send.');
+      }else this.store.reserve(actor.id,key,fingerprint);
       try {
         if(kind==='flex'&&!driver.sendFlex)throw new SendRejectedError(409,'flex_transport_unverified','This adapter does not support Flex sending.');
         if(kind==='file'&&!driver.sendFile)throw new SendRejectedError(409,'file_send_unsupported','This adapter does not support file sending.');

@@ -61,6 +61,8 @@ export class Store {
   }
   audits(limit=80) { return this.db.prepare('SELECT * FROM audit ORDER BY at DESC,rowid DESC LIMIT ?').all(limit).map(({details,...row})=>({...row,...(details?{details:JSON.parse(details)}:{})})); }
   send(actor,key) { return this.db.prepare('SELECT * FROM sends WHERE actor=? AND key=?').get(actor,key); }
+  // A rejected send never reached recipients; the same key may try again.
+  retryRejected(actor,key,fingerprint) { return this.db.prepare("UPDATE sends SET state='pending',result=NULL,at=? WHERE actor=? AND key=? AND fingerprint=? AND state='rejected'").run(new Date().toISOString(),actor,key,fingerprint).changes===1; }
   reserve(actor,key,fingerprint) { this.db.prepare("INSERT INTO sends VALUES(?,?,?,'pending',NULL,?)").run(actor,key,fingerprint,new Date().toISOString()); }
   finishSend(actor,key,state,result) { this.db.prepare('UPDATE sends SET state=?,result=? WHERE actor=? AND key=?').run(state,result ? JSON.stringify(result) : null,actor,key); }
   setting(key,defaultValue) { const r=this.db.prepare('SELECT value FROM settings WHERE key=?').get(key); return r ? JSON.parse(r.value) : defaultValue; }

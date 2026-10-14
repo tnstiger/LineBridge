@@ -74,8 +74,18 @@ test('safe diagnostic survives worker serialization, durable rejection, and idem
   assert.equal(received.message,wire.message);
   const store=new Store(':memory:'),hub=new Hub(store,new Vault(randomBytes(32),'synthetic'));t.after(()=>{hub.close();store.close();});
   const account=await hub.addAccount({label:'Synthetic',kind:'demo'});let calls=0;hub.driver(account.id).send=async()=>{calls++;throw received;};
-  for(let i=0;i<2;i++)await assert.rejects(hub.send(adminActor,account.id,'demo-group','synthetic','preparation-diagnostic-1'),/RECIPIENT_KEY_NEGOTIATION_E2EE_UNSUPPORTED/);
+  await assert.rejects(hub.send(adminActor,account.id,'demo-group','synthetic','preparation-diagnostic-1'),/RECIPIENT_KEY_NEGOTIATION_E2EE_UNSUPPORTED/);
   assert.equal(calls,1);const saved=store.send('local-admin','preparation-diagnostic-1');assert.equal(saved.state,'rejected');assert.equal(JSON.parse(saved.result).message,wire.message);
+  // A rejection sent nothing, so the same key may run again (for example after a fix).
+  await assert.rejects(hub.send(adminActor,account.id,'demo-group','synthetic','preparation-diagnostic-1'),/RECIPIENT_KEY_NEGOTIATION_E2EE_UNSUPPORTED/);assert.equal(calls,2);
+  await assert.rejects(hub.send(adminActor,account.id,'demo-group','different text','preparation-diagnostic-1'),{code:'idempotency_conflict'});assert.equal(calls,2);
+  hub.driver(account.id).send=async()=>{calls++;return {messageId:'ok-1',timestamp:null,delivery:'accepted_by_line',protection:'letter_sealing'};};
+  assert.equal((await hub.send(adminActor,account.id,'demo-group','synthetic','preparation-diagnostic-1')).replayed,false);assert.equal(calls,3);
+  assert.equal((await hub.send(adminActor,account.id,'demo-group','synthetic','preparation-diagnostic-1')).replayed,true,'A sent message is never repeated');assert.equal(calls,3);
+  // An unknown outcome is never retried, even with the same key.
+  hub.driver(account.id).send=async()=>{calls++;throw new Error('connection reset');};
+  await assert.rejects(hub.send(adminActor,account.id,'demo-group','synthetic','unknown-outcome-1'),{code:'delivery_unknown'});
+  await assert.rejects(hub.send(adminActor,account.id,'demo-group','synthetic','unknown-outcome-1'),{code:'delivery_unknown'});assert.equal(calls,4);
 });
 
 test('CLI distinguishes validated pre-dispatch rejection from uncertain 5xx without reflecting arbitrary text',async()=>{
