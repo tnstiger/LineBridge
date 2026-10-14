@@ -51,7 +51,9 @@ test('normal recipients retain real E2EE even with the OA acknowledgment; groups
   const result=await f.driver.send(direct,'synthetic',ack);assert.equal(result.protection,'letter_sealing');assert.equal(result.notice,undefined);
   assert.equal(f.options.e2ee,true);assert.equal(f.options.text,undefined);assert.equal(f.options.chunks.length,5);assert.equal(f.calls.some(c=>c[1]==='getBuddyDetail'),false);
   f.client.e2ee.getE2EELocalPublicKey=async()=>{throw Object.assign(new Error('private'),{name:'RequestError',data:{code:'NOT_FOUND'}});};
-  await assert.rejects(f.driver.send({id:'c'+'3'.repeat(32),kind:'group'},'synthetic',ack),/GROUP_KEY_LOOKUP_NOT_FOUND/);assert.equal(f.sends(),1);
+  // A group without a Letter Sealing key goes out with transport encryption, still without any Buddy lookup.
+  const unsealed=await f.driver.send({id:'c'+'3'.repeat(32),kind:'group'},'synthetic',ack);assert.equal(unsealed.protection,'line_transport');assert.match(unsealed.notice,/no Letter Sealing group key/);
+  assert.equal(f.sends(),2);assert.equal(f.calls.some(c=>c[1]==='getBuddyDetail'),false);
 });
 
 test('observed LINE_AT with businessAccount false requires acknowledgment and matching authenticated MID',async t=>{

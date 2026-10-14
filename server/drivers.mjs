@@ -243,7 +243,7 @@ export class LineDriver {
     }catch(error){throw new SendRejectedError(502,'send_preparation_failed',`Message preparation failed (${error.diagnostic??'MESSAGE_PREPARATION_SDK_ERROR'}). No message was sent.`);}
   }
   async send(chat,text,{acknowledgeOaTransport=false}={},beforeDispatch=()=>{}) {
-    let options,officialAccount=false,protection=chat.kind==='openchat'?'line_transport':'letter_sealing';
+    let options,officialAccount=false,unsealedGroup=false,protection=chat.kind==='openchat'?'line_transport':'letter_sealing';
     if(chat.kind!=='openchat') {
       try {
         const capability=chat.kind==='direct'?await this.monitorRequest(AbortSignal.timeout(15000),()=>officialAccountCapability(this.client,chat)):{officialAccount:false};
@@ -262,6 +262,12 @@ export class LineDriver {
         // Missing keys, timeouts and other errors must not silently downgrade it.
         if(error?.name==='RequestError' && !preparation.diagnostic?.startsWith('BUDDY_LOOKUP_') && discoveryErrorCode(error)==='E2EE_RETRY_PLAIN') {
           options={to:chat.id,text,e2ee:false};protection='line_transport';
+        } else if(chat.kind==='group'&&preparation.diagnostic==='GROUP_KEY_LOOKUP_NOT_FOUND') {
+          // LINE has no Letter Sealing group key for this group (for example a
+          // member has Letter Sealing off). The official apps send such groups
+          // with transport encryption; do the same instead of creating a new
+          // group key, which would change the group's encryption for everyone.
+          options={to:chat.id,text,e2ee:false};protection='line_transport';unsealedGroup=true;
         } else {
           throw new SendRejectedError(502,'send_preparation_failed',`Message preparation failed (${preparation.diagnostic??'MESSAGE_PREPARATION_SDK_ERROR'}). No message was sent. Review this preparation stage before another attempt; do not reset keys or weaken encryption.`);
         }
@@ -279,7 +285,7 @@ export class LineDriver {
     }
     const message=response?.createdSquareMessage?.message ?? response?.squareMessage?.message ?? response;
     if(!message?.id) fail(502,'send_unconfirmed','LINE did not return a message ID. Delivery is unknown; inspect the chat before sending again.');
-    return {messageId:String(message.id),timestamp:normalizeMessage(message).timestamp,delivery:'accepted_by_line',protection,...(officialAccount?{notice:OA_NOTICE}:{})};
+    return {messageId:String(message.id),timestamp:normalizeMessage(message).timestamp,delivery:'accepted_by_line',protection,...(officialAccount?{notice:OA_NOTICE}:unsealedGroup?{notice:UNSEALED_GROUP_NOTICE}:{})};
   }
   // Files are sent only with Letter Sealing: the bytes are encrypted locally with
   // a fresh key, uploaded as an opaque object, then announced in a sealed FILE
@@ -295,6 +301,7 @@ export class LineDriver {
       ({keyMaterial,encryptedData}=await e2ee.encryptByKeyMaterial(bytes));
       chunks=await prepareFile(this.client,chat,keyMaterial,fileName);
     }catch(preparation){
+      if(chat.kind==='group'&&preparation.diagnostic==='GROUP_KEY_LOOKUP_NOT_FOUND')throw new SendRejectedError(409,'file_group_unsealed','This group has no Letter Sealing group key. Files are sent only with Letter Sealing, so no file was sent; text messages to this group use transport encryption.');
       throw new SendRejectedError(502,'send_preparation_failed',`File preparation failed (${preparation.diagnostic??'FILE_PREPARATION_SDK_ERROR'}). No file was sent. Files are sent only with Letter Sealing; do not reset keys or weaken encryption.`);
     }
     let objId;
@@ -319,6 +326,8 @@ export class LineDriver {
     return {messageId:String(message.id),timestamp:normalizeMessage(message).timestamp,delivery:'accepted_by_line',protection:'letter_sealing',fileName,bytes:bytes.length};
   }
 }
+
+export const UNSEALED_GROUP_NOTICE='This group has no Letter Sealing group key, so the message was sent with LINE transport encryption only, as the official LINE apps do for such groups.';
 
 export class DemoDriver {
   constructor() {

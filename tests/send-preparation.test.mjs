@@ -40,7 +40,6 @@ test('missing self key, unsupported peer, malformed negotiation, timeout, group 
     ['RECIPIENT_KEY_NEGOTIATION_SDK_TYPE_ERROR',f=>{f.client.talk.negotiateE2EEPublicKey=async()=>({specVersion:2});}],
     ['RECIPIENT_KEY_NEGOTIATION_TIMEOUT',f=>{f.client.talk.negotiateE2EEPublicKey=async()=>{throw fault('TimeoutError');};}],
     ['RECIPIENT_KEY_NEGOTIATION_NOT_AUTHORIZED_DEVICE',f=>{f.client.talk.negotiateE2EEPublicKey=async()=>{throw fault('RequestError','NOT_AUTHORIZED_DEVICE');};}],
-    ['GROUP_KEY_LOOKUP_NOT_FOUND',f=>{f.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('RequestError','NOT_FOUND');};},group],
     ['ENCRYPTION_SDK_TYPE_ERROR',f=>{f.client.e2ee.encryptE2EETextMessage=()=>{throw fault('TypeError');};}],
     ['RECIPIENT_KEY_NEGOTIATION_LINE_REJECTED',f=>{f.client.talk.negotiateE2EEPublicKey=async()=>{throw fault('RequestError','SECRET_TOKEN');};}]
   ];
@@ -53,8 +52,8 @@ test('concurrent preparations retain their own stages and SDK-handled exceptions
   const f=fixture();let reject;const pending=new Promise((_r,j)=>reject=j);
   f.client.talk.negotiateE2EEPublicKey=()=>pending;
   const one=f.driver.send(direct,'synthetic');const oneCheck=assert.rejects(one,/RECIPIENT_KEY_NEGOTIATION_TIMEOUT/);
-  f.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('RequestError','NOT_FOUND');};
-  await assert.rejects(f.driver.send(group,'synthetic'),/GROUP_KEY_LOOKUP_NOT_FOUND/);reject(fault('TimeoutError'));await oneCheck;
+  f.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('RequestError','NOT_AUTHORIZED_DEVICE');};
+  await assert.rejects(f.driver.send(group,'synthetic'),/GROUP_KEY_LOOKUP_NOT_AUTHORIZED_DEVICE/);reject(fault('TimeoutError'));await oneCheck;
   const original=fault('RequestError','NOT_FOUND');f.client.talk.getLastE2EEGroupSharedKey=async()=>{throw original;};
   f.client.e2ee.encryptE2EEMessage=async function(){try{await this.client.talk.getLastE2EEGroupSharedKey();}catch(error){assert.equal(error,original);return ['synthetic handled'];}};
   assert.deepEqual(await prepareText(f.client,group,'synthetic'),['synthetic handled']);
@@ -83,4 +82,21 @@ test('CLI distinguishes validated pre-dispatch rejection from uncertain 5xx with
   for(const valid of [true,false]){let calls=0;const message=valid?'Message preparation failed (SELF_KEY_LOOKUP_SELF_KEY_MISSING). No message was sent. SECRET raw suffix':'Message preparation failed (SECRET_TOKEN). No message was sent.';
     await assert.rejects(gatewayRequest({url:'http://127.0.0.1:3211',credentials:{token:'synthetic'},path:'/synthetic',method:'POST',send:true,fetchImpl:async()=>{calls++;return new Response(JSON.stringify({error:'send_preparation_failed',message}),{status:502});}}),error=>{assert.equal(error.code,valid?'send_preparation_failed':'delivery_unknown');assert.equal(error.exitCode,valid?6:8);assert.doesNotMatch(error.message,/SECRET/);return true;});assert.equal(calls,1);
   }
+});
+
+test('a group without a Letter Sealing key is sent with transport encryption; nothing else downgrades',async()=>{
+  const f=fixture();let sent;f.client.talk.sendMessage=async options=>{sent=options;return {id:'synthetic-ack'};};
+  f.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('RequestError','NOT_FOUND');};
+  const result=await f.driver.send(group,'synthetic');
+  assert.equal(result.protection,'line_transport');assert.match(result.notice,/no Letter Sealing group key/);
+  assert.deepEqual({to:sent.to,e2ee:sent.e2ee,text:sent.text,chunks:sent.chunks},{to:group.id,e2ee:false,text:'synthetic',chunks:undefined});
+  // Only this exact group condition: other group failures and direct chats still refuse.
+  const other=fixture();other.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('RequestError','NOT_AUTHORIZED_DEVICE');};
+  await assert.rejects(other.driver.send(group,'synthetic'),/GROUP_KEY_LOOKUP_NOT_AUTHORIZED_DEVICE/);assert.equal(other.sends(),0);
+  const timeout=fixture();timeout.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('TimeoutError');};
+  await assert.rejects(timeout.driver.send(group,'synthetic'),/GROUP_KEY_LOOKUP_TIMEOUT/);assert.equal(timeout.sends(),0);
+  // The SDK never registers a replacement group key on the way.
+  const registered=fixture();let registrations=0;registered.client.e2ee.tryRegisterE2EEGroupKey=async()=>{registrations++;return {};};
+  registered.client.e2ee.getE2EELocalPublicKey=async()=>{throw fault('RequestError','NOT_FOUND');};
+  assert.equal((await registered.driver.send(group,'synthetic')).protection,'line_transport');assert.equal(registrations,0);
 });
